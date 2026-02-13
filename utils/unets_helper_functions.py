@@ -119,8 +119,11 @@ class PatchDataset(Dataset):
 
         case = self.cases[idx // self.patches_per_case]
 
-        image = nib.load(os.path.join(self.images_dir, f"{case}.nii.gz")).get_fdata()
+        image = nib.load(os.path.join(self.images_dir, f"{case}.nii.gz")).get_fdata(dtype=np.float32)
         label = nib.load(os.path.join(self.labels_dir, f"{case}.nii.gz")).get_fdata()
+        label = label.astype(np.uint8)
+
+
 
         z, y, x = image.shape
         ps = self.patch_size
@@ -180,6 +183,13 @@ class PatchDataset(Dataset):
 
         return image_patch, label_patch
 
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def dice_loss(pred, target, num_classes=7 ,smooth=1e-5):
     pred = torch.softmax(pred, dim=1)
@@ -309,20 +319,18 @@ def load_checkpoint(model, optimizer, load_path, device):
 
 
 def sliding_window_inference(model, image, patch_size=80, stride=60, device="cuda"):
-    """
-    Performs sliding window inference over full volume.
-    """
 
     model.eval()
     image = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
 
     _, _, D, H, W = image.shape
-
     num_classes = 7
-    output = torch.zeros((1, num_classes, D, H, W), device=device)
+
+    output = torch.zeros((1, num_classes, D, H, W), dtype=torch.float32)
     count_map = torch.zeros_like(output)
 
     with torch.no_grad():
+
         z_steps = list(range(0, D - patch_size, stride)) + [D - patch_size]
         y_steps = list(range(0, H - patch_size, stride)) + [H - patch_size]
         x_steps = list(range(0, W - patch_size, stride)) + [W - patch_size]
@@ -331,19 +339,23 @@ def sliding_window_inference(model, image, patch_size=80, stride=60, device="cud
             for y in y_steps:
                 for x in x_steps:
 
-
                     patch = image[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size]
-                    pred = model(patch)
-                    pred = torch.softmax(pred, dim=1)
 
+                    logits = model(patch).cpu()
 
-                    output[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += pred
+                    output[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += logits
                     count_map[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += 1
 
+    count_map[count_map == 0] = 1
     output = output / count_map
+
+    # Apply softmax AFTER averaging logits
+    output = torch.softmax(output, dim=1)
+
     output = torch.argmax(output, dim=1)
 
     return output.squeeze().cpu().numpy()
+
 
 
 def evaluate_full_volume(model, cases, images_dir, labels_dir, device="cuda"):
@@ -472,3 +484,4 @@ def show_organ_overlay(ct_slice, gt_slice, pred_slice, organ_id=None):
 
     plt.tight_layout()
     plt.show()
+
