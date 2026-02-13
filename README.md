@@ -59,7 +59,7 @@ The segmentation module serves as a validation backbone for the full MRI-to-sCT 
 # Project Setup
 
 ## 1. Create Virtual Environment
-
+Python 3.10.11 was working fine without errors (if getting errors switch to this)
 ```bash
 python -m venv venv
 ```
