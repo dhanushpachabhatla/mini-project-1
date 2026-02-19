@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------- Double Conv ----------
+#  Double Conv 
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -20,7 +20,7 @@ class DoubleConv(nn.Module):
         return self.block(x)
 
 
-# ---------- Attention Gate ----------
+#  Attention Gate 
 class AttentionGate(nn.Module):
     def __init__(self, F_g, F_l, F_int):
         super().__init__()
@@ -53,7 +53,7 @@ class AttentionGate(nn.Module):
         return x * psi
 
 
-# ---------- Attention UNet 3D ----------
+#  Attention UNet 3D 
 class AttentionUNet3D(nn.Module):
     def __init__(self, in_channels=1, out_channels=7, base_filters=16):
         super().__init__()

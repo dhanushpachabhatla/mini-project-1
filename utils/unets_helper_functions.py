@@ -9,7 +9,7 @@ from tqdm import tqdm
 import random
 import torchio as tio
 from models.unet_3d import UNet3D
-
+import scipy.ndimage as ndi
 
 # used for unet
 # class PatchDataset(Dataset):
@@ -106,11 +106,11 @@ class PatchDataset(Dataset):
 
         if augment:
             self.transform = tio.Compose([
-                tio.RandomFlip(axes=('LR',)),
-                tio.RandomAffine(scales=(0.9, 1.1), degrees=10),
-                tio.RandomNoise(mean=0, std=0.01),
-                tio.RandomGamma(log_gamma=(-0.3, 0.3))
-            ])
+            tio.RandomFlip(axes=(0,1,2), flip_probability=0.5),
+            tio.RandomAffine(scales=(0.85, 1.15), degrees=15,isotropic=True),
+            tio.RandomNoise(mean=0, std=0.01),
+            tio.RandomGamma(log_gamma=(-0.3, 0.3))
+        ])
 
     def __len__(self):
         return len(self.cases) * self.patches_per_case
@@ -128,7 +128,7 @@ class PatchDataset(Dataset):
         z, y, x = image.shape
         ps = self.patch_size
 
-        # ------ Balanced Sampling ------
+        # Balanced Sampling 
         if random.random() < self.foreground_prob:
 
             # Get all foreground classes present in this case
@@ -164,7 +164,7 @@ class PatchDataset(Dataset):
             z0 = random.randint(0, z - ps)
             y0 = random.randint(0, y - ps)
             x0 = random.randint(0, x - ps)
-        # 
+        
 
         image_patch = image[z0:z0+ps, y0:y0+ps, x0:x0+ps]
         label_patch = label[z0:z0+ps, y0:y0+ps, x0:x0+ps]
@@ -315,10 +315,63 @@ def load_checkpoint(model, optimizer, load_path, device):
     return model, optimizer, epoch, best_val_loss
 
 
+def get_gaussian_weight_map(patch_size):
+    import numpy as np
+
+    ranges = [np.linspace(-1, 1, s) for s in patch_size]
+    z, y, x = np.meshgrid(*ranges, indexing="ij")
+
+    dist = z**2 + y**2 + x**2
+    gaussian = np.exp(-dist / 0.5)
+
+    gaussian = gaussian / np.max(gaussian)
+    return torch.tensor(gaussian, dtype=torch.float32)
 
 
 
-def sliding_window_inference(model, image, patch_size=80, stride=60, device="cuda"):
+def keep_largest_component(mask):
+    labeled, num = ndi.label(mask)
+
+    if num == 0:
+        return mask
+
+    sizes = ndi.sum(mask, labeled, range(1, num+1))
+    largest_label = np.argmax(sizes) + 1
+
+    return labeled == largest_label
+
+def remove_small_components(mask, min_size=200):
+    labeled, num = ndi.label(mask)
+    if num == 0:
+        return mask
+
+    sizes = ndi.sum(mask, labeled, range(1, num+1))
+    keep_labels = [i+1 for i, s in enumerate(sizes) if s >= min_size]
+
+    if len(keep_labels) == 0:
+        return mask  # fallback
+
+    return np.isin(labeled, keep_labels)
+
+
+def postprocess_segmentation(pred):
+    processed = np.zeros_like(pred)
+
+    for cls in range(1, 7):
+        organ_mask = pred == cls
+        if organ_mask.sum() == 0:
+            continue
+
+        # remove only tiny blobs, keep real organ
+        organ_mask = remove_small_components(organ_mask, min_size=200)
+
+        processed[organ_mask] = cls
+
+    return processed
+
+
+
+def sliding_window_inference(model, image, patch_size=96, stride=40, device="cuda"):
 
     model.eval()
     image = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
@@ -327,7 +380,11 @@ def sliding_window_inference(model, image, patch_size=80, stride=60, device="cud
     num_classes = 7
 
     output = torch.zeros((1, num_classes, D, H, W), dtype=torch.float32)
-    count_map = torch.zeros_like(output)
+    weight_map = torch.zeros_like(output)
+
+    gaussian = get_gaussian_weight_map((patch_size, patch_size, patch_size))
+    gaussian = gaussian.to(device)
+    gaussian = gaussian.unsqueeze(0).unsqueeze(0)  # shape 1x1xDxHxW
 
     with torch.no_grad():
 
@@ -341,17 +398,19 @@ def sliding_window_inference(model, image, patch_size=80, stride=60, device="cud
 
                     patch = image[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size]
 
-                    logits = model(patch).cpu()
+                    logits = model(patch)
 
-                    output[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += logits
-                    count_map[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += 1
+                    # Apply gaussian weighting
+                    weighted_logits = logits * gaussian
 
-    count_map[count_map == 0] = 1
-    output = output / count_map
+                    output[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += weighted_logits.cpu()
+                    weight_map[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += gaussian.cpu()
 
-    # Apply softmax AFTER averaging logits
+    weight_map[weight_map == 0] = 1e-6
+    output = output / weight_map
+
+
     output = torch.softmax(output, dim=1)
-
     output = torch.argmax(output, dim=1)
 
     return output.squeeze().cpu().numpy()
@@ -370,6 +429,7 @@ def evaluate_full_volume(model, cases, images_dir, labels_dir, device="cuda"):
         label = label.astype(np.uint8)
 
         pred = sliding_window_inference(model, image, device=device)
+        # pred = postprocess_segmentation(pred)
         print("Unique pred labels:", np.unique(pred))
         print("Unique GT labels:", np.unique(label))
 

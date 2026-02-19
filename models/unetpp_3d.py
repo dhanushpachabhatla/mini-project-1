@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 
 
-# -------------------------
+
 # Double Convolution Block
-# -------------------------
+
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -21,9 +21,9 @@ class DoubleConv(nn.Module):
         return self.block(x)
 
 
-# -------------------------
+
 # UNet++ 3D (Lightweight)
-# -------------------------
+
 class UNetPP3D(nn.Module):
     def __init__(self, in_channels=1, out_channels=7, base_filters=16):
         super().__init__()
