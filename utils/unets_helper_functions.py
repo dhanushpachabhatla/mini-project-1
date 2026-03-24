@@ -106,8 +106,11 @@ class PatchDataset(Dataset):
 
         if augment:
             self.transform = tio.Compose([
-            tio.RandomFlip(axes=(0,1,2), flip_probability=0.5),
-            tio.RandomAffine(scales=(0.85, 1.15), degrees=15,isotropic=True),
+            tio.RandomFlip(axes=(0,), p=0.5),   # Left-Right axis
+            tio.RandomFlip(axes=(1,), p=0.2),
+            tio.RandomFlip(axes=(2,), p=0.2),
+
+            tio.RandomAffine(scales=(0.85, 1.15), degrees=15, isotropic=True),
             tio.RandomNoise(mean=0, std=0.01),
             tio.RandomGamma(log_gamma=(-0.3, 0.3))
         ])
@@ -209,6 +212,138 @@ def dice_loss(pred, target, num_classes=7 ,smooth=1e-5):
 
 
 
+class PatchDataset_cbam(Dataset):
+    def __init__(
+        self,
+        cases,
+        images_dir,
+        labels_dir,
+        patches_per_case=1,
+        patch_size=96,
+        augment=False,
+        foreground_prob=0.5,
+    ):
+        self.cases = cases
+        self.images_dir = images_dir
+        self.labels_dir = labels_dir
+        self.patch_size = patch_size
+        self.patches_per_case = patches_per_case
+        self.augment = augment
+        self.foreground_prob = foreground_prob
+
+        if augment:
+            self.transform = tio.Compose([
+            tio.RandomFlip(axes=(0,), p=0.5),   # Left-Right axis
+            tio.RandomFlip(axes=(1,), p=0.2),
+            tio.RandomFlip(axes=(2,), p=0.2),
+
+            tio.RandomAffine(scales=(0.85, 1.15), degrees=15, isotropic=True),
+            tio.RandomNoise(mean=0, std=0.01),
+            tio.RandomGamma(log_gamma=(-0.3, 0.3))
+        ])
+
+    def __len__(self):
+        return len(self.cases) * self.patches_per_case
+
+    def __getitem__(self, idx):
+
+        case = self.cases[idx // self.patches_per_case]
+
+        image = nib.load(os.path.join(self.images_dir, f"{case}.nii.gz")).get_fdata(dtype=np.float32)
+        label = nib.load(os.path.join(self.labels_dir, f"{case}.nii.gz")).get_fdata()
+        label = label.astype(np.uint8)
+
+
+
+        z, y, x = image.shape
+        ps = self.patch_size
+
+        # Balanced Sampling 
+        if random.random() < self.foreground_prob:
+
+            classes = np.unique(label)
+            classes = classes[classes != 0]
+
+            if len(classes) > 0:
+
+                # 🔥 Mild parotid bias (NOT too aggressive)
+                if random.random() < 0.25:   # was 0.4 → reduce
+                    parotid_classes = [c for c in classes if c in [4, 5]]
+
+                    if len(parotid_classes) > 0:
+                        chosen_class = random.choice(parotid_classes)
+                    else:
+                        chosen_class = random.choice(classes.tolist())
+                else:
+                    chosen_class = random.choice(classes.tolist())
+
+                class_voxels = np.argwhere(label == chosen_class)
+
+                if len(class_voxels) > 0:
+                    center = class_voxels[random.randint(0, len(class_voxels) - 1)]
+
+                    z0 = int(np.clip(center[0] - ps // 2, 0, z - ps))
+                    y0 = int(np.clip(center[1] - ps // 2, 0, y - ps))
+                    x0 = int(np.clip(center[2] - ps // 2, 0, x - ps))
+                else:
+                    z0 = random.randint(0, z - ps)
+                    y0 = random.randint(0, y - ps)
+                    x0 = random.randint(0, x - ps)
+            else:
+                # no foreground in volume (rare)
+                z0 = random.randint(0, z - ps)
+                y0 = random.randint(0, y - ps)
+                x0 = random.randint(0, x - ps)
+
+        else:
+            # ------ Random Crop ------
+            z0 = random.randint(0, z - ps)
+            y0 = random.randint(0, y - ps)
+            x0 = random.randint(0, x - ps)
+        
+
+        image_patch = image[z0:z0+ps, y0:y0+ps, x0:x0+ps]
+        label_patch = label[z0:z0+ps, y0:y0+ps, x0:x0+ps]
+
+        image_patch = torch.tensor(image_patch, dtype=torch.float32).unsqueeze(0)
+        label_patch = torch.tensor(label_patch, dtype=torch.long)
+
+        if self.augment:
+            subject = tio.Subject(
+                image=tio.ScalarImage(tensor=image_patch),
+                label=tio.LabelMap(tensor=label_patch.unsqueeze(0))
+            )
+            subject = self.transform(subject)
+            image_patch = subject.image.data
+            label_patch = subject.label.data.squeeze(0).long()
+
+        return image_patch, label_patch
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def dice_loss(pred, target, num_classes=7 ,smooth=1e-5):
+    pred = torch.softmax(pred, dim=1)
+    target = target.long()
+
+    target_onehot = torch.nn.functional.one_hot(target, num_classes=num_classes)
+    target_onehot = target_onehot.permute(0,4,1,2,3).float()
+
+    intersection = (pred * target_onehot).sum(dim=(2,3,4))
+    union = pred.sum(dim=(2,3,4)) + target_onehot.sum(dim=(2,3,4))
+
+    dice = (2 * intersection + smooth) / (union + smooth)
+
+    dice = dice[:, 1:]  
+
+    return 1 - dice.mean()
+
+
 
 #  Validation Dice Metric (Per Organ)
 def compute_per_class_dice(pred, target, num_classes=7, smooth=1e-5):
@@ -257,6 +392,79 @@ def train_one_epoch(model, loader, optimizer, scaler, ce_loss, device, num_class
         total_loss += loss.item()
 
     return total_loss / len(loader)
+
+def train_one_epoch_cbam(model, loader, optimizer, scaler, loss_fn, device):
+
+    model.train()
+    total_loss = 0
+
+    for images, labels in tqdm(loader):
+
+        images = images.to(device)
+        labels = labels.long().to(device)
+
+        optimizer.zero_grad()
+
+        with torch.amp.autocast("cuda"):
+
+            outputs = model(images)
+
+            # Deep supervision unpack
+            out, ds2, ds3, ds4 = outputs
+
+            loss_main = loss_fn(out, labels)
+            loss_ds2  = loss_fn(ds2, labels)
+            loss_ds3  = loss_fn(ds3, labels)
+            loss_ds4  = loss_fn(ds4, labels)
+
+            loss = (
+                1.0 * loss_main +
+                0.5 * loss_ds2 +
+                0.25 * loss_ds3 +
+                0.125 * loss_ds4
+            )
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+def validate_one_epoch_cbam(model, loader, loss_fn, device, num_classes=7):
+
+    model.eval()
+    total_loss = 0
+    all_dices = []
+
+    with torch.no_grad():
+        for images, labels in loader:
+
+            images = images.to(device)
+            labels = labels.long().to(device)
+
+            with torch.amp.autocast("cuda"):
+
+                outputs = model(images)
+
+                # Only MAIN output for validation
+                out = outputs[0]
+
+                loss = loss_fn(out, labels)
+
+            total_loss += loss.item()
+
+            batch_dice = compute_per_class_dice(out, labels, num_classes)
+            all_dices.append(batch_dice)
+
+    mean_loss = total_loss / len(loader)
+
+    all_dices = np.array(all_dices)
+    mean_dices = np.mean(all_dices, axis=0)
+
+    return mean_loss, mean_dices
 
 
 #  Validation Function
@@ -371,49 +579,87 @@ def postprocess_segmentation(pred):
 
 
 
-def sliding_window_inference(model, image, patch_size=96, stride=40, device="cuda"):
+# def sliding_window_inference(model, image, patch_size=80, stride=60, device="cuda"):
 
+#     model.eval()
+#     image = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+
+#     _, _, D, H, W = image.shape
+#     num_classes = 7
+
+#     output = torch.zeros((1, num_classes, D, H, W), dtype=torch.float32)
+#     weight_map = torch.zeros_like(output)
+
+#     gaussian = get_gaussian_weight_map((patch_size, patch_size, patch_size))
+#     gaussian = gaussian.to(device)
+#     gaussian = gaussian.unsqueeze(0).unsqueeze(0)  # shape 1x1xDxHxW
+
+#     with torch.no_grad():
+
+#         z_steps = list(range(0, D - patch_size, stride)) + [D - patch_size]
+#         y_steps = list(range(0, H - patch_size, stride)) + [H - patch_size]
+#         x_steps = list(range(0, W - patch_size, stride)) + [W - patch_size]
+
+#         for z in z_steps:
+#             for y in y_steps:
+#                 for x in x_steps:
+
+#                     patch = image[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size]
+
+#                     logits = model(patch)
+
+#                     # Apply gaussian weighting
+#                     weighted_logits = logits * gaussian
+
+#                     output[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += weighted_logits.cpu()
+#                     weight_map[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += gaussian.cpu()
+
+#     weight_map[weight_map == 0] = 1e-6
+#     output = output / weight_map
+
+
+#     output = torch.softmax(output, dim=1)
+#     output = torch.argmax(output, dim=1)
+
+#     return output.squeeze().cpu().numpy()
+
+
+
+def sliding_window_inference(model, image, patch_size=80, stride=24, device="cuda"):
     model.eval()
-    image = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
 
-    _, _, D, H, W = image.shape
+    image_t = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+    _, _, D, H, W = image_t.shape
     num_classes = 7
 
-    output = torch.zeros((1, num_classes, D, H, W), dtype=torch.float32)
-    weight_map = torch.zeros_like(output)
+    # ✅ Accumulation on CPU — avoids OOM on large volumes
+    output     = torch.zeros((1, num_classes, D, H, W), dtype=torch.float32)  # CPU
+    weight_map = torch.zeros_like(output)                                       # CPU
 
-    gaussian = get_gaussian_weight_map((patch_size, patch_size, patch_size))
-    gaussian = gaussian.to(device)
-    gaussian = gaussian.unsqueeze(0).unsqueeze(0)  # shape 1x1xDxHxW
+    gaussian = get_gaussian_weight_map((patch_size, patch_size, patch_size))   # CPU
+    gaussian_gpu = gaussian.unsqueeze(0).unsqueeze(0).to(device)               # GPU for multiply
+    gaussian_cpu = gaussian.unsqueeze(0).unsqueeze(0)                          # CPU for accumulate
 
     with torch.no_grad():
+        z_steps = sorted(set(list(range(0, max(1, D - patch_size), stride)) + [max(0, D - patch_size)]))
+        y_steps = sorted(set(list(range(0, max(1, H - patch_size), stride)) + [max(0, H - patch_size)]))
+        x_steps = sorted(set(list(range(0, max(1, W - patch_size), stride)) + [max(0, W - patch_size)]))
 
-        z_steps = list(range(0, D - patch_size, stride)) + [D - patch_size]
-        y_steps = list(range(0, H - patch_size, stride)) + [H - patch_size]
-        x_steps = list(range(0, W - patch_size, stride)) + [W - patch_size]
+        print(f"Volume: {D}x{H}x{W} | Patches: {len(z_steps)*len(y_steps)*len(x_steps)}")
 
         for z in z_steps:
             for y in y_steps:
                 for x in x_steps:
+                    patch = image_t[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size]
 
-                    patch = image[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size]
+                    probs = torch.softmax(model(patch), dim=1)          # GPU
+                    probs_cpu = (probs * gaussian_gpu).cpu()            # weighted, move to CPU
 
-                    logits = model(patch)
+                    output[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size]     += probs_cpu
+                    weight_map[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += gaussian_cpu
 
-                    # Apply gaussian weighting
-                    weighted_logits = logits * gaussian
-
-                    output[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += weighted_logits.cpu()
-                    weight_map[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += gaussian.cpu()
-
-    weight_map[weight_map == 0] = 1e-6
-    output = output / weight_map
-
-
-    output = torch.softmax(output, dim=1)
-    output = torch.argmax(output, dim=1)
-
-    return output.squeeze().cpu().numpy()
+    output = output / weight_map.clamp(min=1e-6)
+    return torch.argmax(output, dim=1).squeeze().numpy()
 
 
 
