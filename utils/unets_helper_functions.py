@@ -1,15 +1,16 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import nibabel as nib
+import torch.nn.functional as F
 import numpy as np
+
+from torch.utils.data import Dataset
+import nibabel as nib
 import os
 from tqdm import tqdm
 import random
 import torchio as tio
-from models.unet_3d import UNet3D
 import scipy.ndimage as ndi
+from scipy.ndimage import distance_transform_edt
 
 class PatchDataset(Dataset):
     def __init__(
@@ -136,6 +137,160 @@ def dice_loss(pred, target, num_classes=7 ,smooth=1e-5):
 
     return 1 - dice.mean()
 
+
+def compute_distance_map_batch(self, G):
+        """
+        Computes the Euclidean Distance Transform (EDT) for the boundary of each class.
+        G: One-hot encoded ground truth tensor of shape (B, C, D, H, W)
+        """
+        B, C, D, H, W = G.shape
+        
+        # --- Eq 2: Extracting the Boundary (B_c = G_c - erode(G_c)) ---
+        # We can perform morphological erosion highly efficiently on the GPU 
+        # using a 3x3x3 max pooling operation on the inverted mask.
+        G_inv = 1.0 - G
+        G_inv_dilated = F.max_pool3d(G_inv, kernel_size=3, stride=1, padding=1)
+        G_eroded = 1.0 - G_inv_dilated
+        
+        # B_c contains 1s only on the outer shell of the organ
+        B_c = (G - G_eroded).clamp(min=0)
+        
+        # --- Eq 3: Distance Transform ---
+        # Moving to CPU purely for the exact Euclidean Distance Transform
+        B_c_np = B_c.detach().cpu().numpy()
+        D_c_map_np = np.zeros_like(B_c_np, dtype=np.float32)
+        
+        for b in range(B):
+            for c in range(C):
+                # distance_transform_edt calculates distance to the nearest '0'.
+                # Our boundary is '1', so we invert the mask to calculate distance TO the boundary.
+                bg_mask = 1.0 - B_c_np[b, c]
+                D_c_map_np[b, c] = distance_transform_edt(bg_mask)
+                
+        # Send the computed distances back to the GPU
+        return torch.tensor(D_c_map_np, device=G.device, dtype=torch.float32)
+
+
+class final_PatchDataset_cbam(Dataset):
+    def __init__(
+        self,
+        cases,
+        images_dir,
+        labels_dir,
+        patches_per_case=1,
+        patch_size=96,
+        augment=False,
+        foreground_prob=0.5,
+    ):
+        self.cases = cases
+        self.images_dir = images_dir
+        self.labels_dir = labels_dir
+        self.patch_size = patch_size
+        self.patches_per_case = patches_per_case
+        self.augment = augment
+        self.foreground_prob = foreground_prob
+
+        if augment:
+            self.transform = tio.Compose([
+            tio.RandomFlip(axes=(0,), p=0.5),   # Left-Right axis
+            tio.RandomFlip(axes=(1,), p=0.2),
+            tio.RandomFlip(axes=(2,), p=0.2),
+
+            tio.RandomAffine(scales=(0.85, 1.15), degrees=15, isotropic=True),
+            tio.RandomNoise(mean=0, std=0.01),
+            tio.RandomGamma(log_gamma=(-0.3, 0.3))
+        ])
+
+    def __len__(self):
+        return len(self.cases) * self.patches_per_case
+
+    def __getitem__(self, idx):
+
+        case = self.cases[idx // self.patches_per_case]
+
+        image = nib.load(os.path.join(self.images_dir, f"{case}.nii.gz")).get_fdata(dtype=np.float32)
+        label = nib.load(os.path.join(self.labels_dir, f"{case}.nii.gz")).get_fdata()
+        label = label.astype(np.uint8)
+
+
+
+        z, y, x = image.shape
+        ps = self.patch_size
+
+        # Balanced Sampling 
+        if random.random() < self.foreground_prob:
+
+            classes = np.unique(label)
+            classes = classes[classes != 0]
+
+            if len(classes) > 0:
+
+                # Mild parotid bias 
+                if random.random() < 0.25:   
+                    parotid_classes = [c for c in classes if c in [4, 5]]
+
+                    if len(parotid_classes) > 0:
+                        chosen_class = random.choice(parotid_classes)
+                    else:
+                        chosen_class = random.choice(classes.tolist())
+                else:
+                    chosen_class = random.choice(classes.tolist())
+
+                class_voxels = np.argwhere(label == chosen_class)
+
+                if len(class_voxels) > 0:
+                    center = class_voxels[random.randint(0, len(class_voxels) - 1)]
+
+                    z0 = int(np.clip(center[0] - ps // 2, 0, z - ps))
+                    y0 = int(np.clip(center[1] - ps // 2, 0, y - ps))
+                    x0 = int(np.clip(center[2] - ps // 2, 0, x - ps))
+                else:
+                    z0 = random.randint(0, z - ps)
+                    y0 = random.randint(0, y - ps)
+                    x0 = random.randint(0, x - ps)
+            else:
+                # no foreground in volume (rare)
+                z0 = random.randint(0, z - ps)
+                y0 = random.randint(0, y - ps)
+                x0 = random.randint(0, x - ps)
+
+        else:
+            # ------ Random Crop ------
+            z0 = random.randint(0, z - ps)
+            y0 = random.randint(0, y - ps)
+            x0 = random.randint(0, x - ps)
+        
+
+        image_patch = image[z0:z0+ps, y0:y0+ps, x0:x0+ps]
+        label_patch = label[z0:z0+ps, y0:y0+ps, x0:x0+ps]
+
+        # -------- DISTANCE MAP COMPUTATION --------
+        dist_map = np.zeros_like(label_patch, dtype=np.float32)
+
+        classes = np.unique(label_patch)
+        classes = classes[classes != 0]
+
+        for c in classes:
+            mask = (label_patch == c)
+            dist = compute_distance_map(mask)
+            dist_map[mask] = dist[mask]
+        
+        image_patch = torch.tensor(image_patch, dtype=torch.float32).unsqueeze(0)
+        label_patch = torch.tensor(label_patch, dtype=torch.long)
+        dist_map = torch.tensor(dist_map, dtype=torch.float32)
+        
+        if self.augment:
+            subject = tio.Subject(
+                image=tio.ScalarImage(tensor=image_patch),
+                label=tio.LabelMap(tensor=label_patch.unsqueeze(0)),
+                dist=tio.ScalarImage(tensor=dist_map.unsqueeze(0))  
+            )
+            subject = self.transform(subject)
+            image_patch = subject.image.data
+            label_patch = subject.label.data.squeeze(0).long()
+            dist_map = subject.dist.data.squeeze(0)
+
+        return image_patch, label_patch, dist_map
 
 
 class PatchDataset_cbam(Dataset):
@@ -329,6 +484,7 @@ def train_one_epoch_cbam(model, loader, optimizer, scaler, loss_fn, device):
         images = images.to(device)
         labels = labels.long().to(device)
 
+        optimizer.zero_grad()
         optimizer.zero_grad()
 
         with torch.amp.autocast("cuda"):
