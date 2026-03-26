@@ -266,8 +266,8 @@ class PatchDataset_cbam(Dataset):
 
             if len(classes) > 0:
 
-                # 🔥 Mild parotid bias (NOT too aggressive)
-                if random.random() < 0.25:   # was 0.4 → reduce
+
+                if random.random() < 0.25: 
                     parotid_classes = [c for c in classes if c in [4, 5]]
 
                     if len(parotid_classes) > 0:
