@@ -74,11 +74,6 @@ class nnUNet3D(nn.Module):
         self.up2 = UpBlock(f*4, f*2, f*2)
         self.up1 = UpBlock(f*2, f, f)
 
-        # Deep supervision heads (nnU-Net key feature)
-        self.ds4 = nn.Conv3d(f*8, out_channels, 1)
-        self.ds3 = nn.Conv3d(f*4, out_channels, 1)
-        self.ds2 = nn.Conv3d(f*2, out_channels, 1)
-
         self.final = nn.Conv3d(f, out_channels, 1)
         self.apply(self._init_weights)
 
@@ -99,8 +94,6 @@ class nnUNet3D(nn.Module):
         d1 = self.up1(d2, e1)
 
         out = self.final(d1)
-
-        # Return deep supervision outputs (only used later)
         return out
     
     def _init_weights(self, m):
