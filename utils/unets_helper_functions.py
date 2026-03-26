@@ -708,6 +708,85 @@ def evaluate_full_volume(model, cases, images_dir, labels_dir, device="cuda"):
     return mean_dice, std_dice
 
 
+def sliding_window_cbam(model, image, patch_size=96, stride=48, device="cuda"):
+    model.eval()
+
+    image_t = torch.tensor(image, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+    _, _, D, H, W = image_t.shape
+    num_classes = 7
+
+    # Accumulation on CPU — avoids OOM on large volumes
+    output     = torch.zeros((1, num_classes, D, H, W), dtype=torch.float32)  # CPU
+    weight_map = torch.zeros_like(output)                                       # CPU
+
+    gaussian = get_gaussian_weight_map((patch_size, patch_size, patch_size))   # CPU
+    gaussian_gpu = gaussian.unsqueeze(0).unsqueeze(0).to(device)               # GPU for multiply
+    gaussian_cpu = gaussian.unsqueeze(0).unsqueeze(0)                          # CPU for accumulate
+
+    with torch.no_grad():
+        z_steps = sorted(set(list(range(0, max(1, D - patch_size), stride)) + [max(0, D - patch_size)]))
+        y_steps = sorted(set(list(range(0, max(1, H - patch_size), stride)) + [max(0, H - patch_size)]))
+        x_steps = sorted(set(list(range(0, max(1, W - patch_size), stride)) + [max(0, W - patch_size)]))
+
+        print(f"Volume: {D}x{H}x{W} | Patches: {len(z_steps)*len(y_steps)*len(x_steps)} | Stride: {stride}")
+
+        for z in z_steps:
+            for y in y_steps:
+                for x in x_steps:
+                    patch = image_t[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size]
+
+                    # Extract the first output tuple for CBAM model (deep supervision wrapper)
+                    logits = model(patch)[0]
+                    probs = torch.softmax(logits, dim=1)                # GPU
+                    probs_cpu = (probs * gaussian_gpu).cpu()            # weighted, move to CPU
+
+                    output[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size]     += probs_cpu
+                    weight_map[:, :, z:z+patch_size, y:y+patch_size, x:x+patch_size] += gaussian_cpu
+
+    output = output / weight_map.clamp(min=1e-6)
+    return torch.argmax(output, dim=1).squeeze().numpy()
+
+
+def evaluate_full_volume_cbam(model, cases, images_dir, labels_dir, patch_size=96, stride=48, device="cuda"):
+    model.eval()
+    all_dices = []
+
+    for case in cases:
+        image = nib.load(f"{images_dir}/{case}.nii.gz").get_fdata(dtype=np.float32)
+        label = nib.load(f"{labels_dir}/{case}.nii.gz").get_fdata()
+        label = label.astype(np.uint8)
+
+        # Using CBAM-specific sliding window logic along with new params
+        pred = sliding_window_cbam(model, image, patch_size=patch_size, stride=stride, device=device)
+        
+        print("Unique pred labels:", np.unique(pred))
+        print("Unique GT labels:", np.unique(label))
+
+        case_dices = []
+        for cls in range(1, 7):  # ignore background
+            pred_cls = (pred == cls)
+            label_cls = (label == cls)
+
+            intersection = np.sum(pred_cls & label_cls)
+            union = np.sum(pred_cls) + np.sum(label_cls)
+
+            dice = (2 * intersection + 1e-5) / (union + 1e-5)
+            case_dices.append(dice)
+
+        all_dices.append(case_dices)
+        print(f"{case} Dice:", case_dices)
+
+    all_dices = np.array(all_dices)
+
+    mean_dice = np.mean(all_dices, axis=0)
+    std_dice = np.std(all_dices, axis=0)
+
+    print("\nMean Dice per organ (CBAM):", mean_dice)
+    print("Std Dice per organ (CBAM):", std_dice)
+
+    return mean_dice, std_dice
+
+
 import matplotlib.pyplot as plt
 import numpy as np
 

@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# -------------------------
+
 # CBAM (3D)
-# -------------------------
+
 class ChannelAttention(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super().__init__()
@@ -52,9 +52,9 @@ class CBAM3D(nn.Module):
         return x
 
 
-# -------------------------
+
 # Residual Block
-# -------------------------
+
 class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -86,9 +86,8 @@ class ResidualBlock(nn.Module):
         return x
 
 
-# -------------------------
+
 # Upsample Block + CBAM
-# -------------------------
 class UpBlock(nn.Module):
     def __init__(self, in_channels, skip_channels, out_channels, use_cbam=True):
         super().__init__()
@@ -111,9 +110,8 @@ class UpBlock(nn.Module):
         return x
 
 
-# -------------------------
+
 # FINAL nnUNet Model
-# -------------------------
 class nnUNet3D_CBAM(nn.Module):
     def __init__(self, in_channels=1, out_channels=7, base_filters=24):
         super().__init__()
