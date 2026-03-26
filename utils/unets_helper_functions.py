@@ -11,80 +11,6 @@ import torchio as tio
 from models.unet_3d import UNet3D
 import scipy.ndimage as ndi
 
-# used for unet
-# class PatchDataset(Dataset):
-#     def __init__(self, cases, images_dir, labels_dir, patches_per_case=1, patch_size=96, augment=False, foreground_prob=0.5):
-#         self.cases = cases
-#         self.images_dir = images_dir
-#         self.labels_dir = labels_dir
-#         self.patch_size = patch_size
-#         self.patches_per_case = patches_per_case
-#         self.augment = augment
-#         self.foreground_prob = foreground_prob 
-
-#         if augment:
-#             self.transform = tio.Compose([
-#                 tio.RandomFlip(axes=('LR',)),
-#                 tio.RandomAffine(scales=(0.9, 1.1), degrees=10),
-#                 tio.RandomNoise(mean=0, std=0.01),
-#                 tio.RandomGamma(log_gamma=(-0.3, 0.3))
-#             ])
-
-#     def __len__(self):
-#         return len(self.cases) * self.patches_per_case
-
-#     def __getitem__(self, idx):
-#         case = self.cases[idx // self.patches_per_case]
-
-#         image = nib.load(os.path.join(self.images_dir, f"{case}.nii.gz")).get_fdata()
-#         label = nib.load(os.path.join(self.labels_dir, f"{case}.nii.gz")).get_fdata()
-
-#         z, y, x = image.shape
-#         ps = self.patch_size
-
-#         # --- KEY FIX: Forced Foreground Sampling ---
-#         # 50% chance to force the patch to be centered on an organ
-#         if random.random() < self.foreground_prob:
-#             # Find all coordinates that are NOT background
-#             fg_indices = np.argwhere(label > 0)
-            
-#             if len(fg_indices) > 0:
-#                 # Pick a random foreground voxel
-#                 center = fg_indices[random.randint(0, len(fg_indices) - 1)]
-                
-#                 # Calculate top-left corner (z0, y0, x0) to center the patch on that voxel
-#                 z0 = int(np.clip(center[0] - ps // 2, 0, z - ps))
-#                 y0 = int(np.clip(center[1] - ps // 2, 0, y - ps))
-#                 x0 = int(np.clip(center[2] - ps // 2, 0, x - ps))
-#             else:
-#                 # Fallback if the volume is empty (rare)
-#                 z0 = random.randint(0, z - ps)
-#                 y0 = random.randint(0, y - ps)
-#                 x0 = random.randint(0, x - ps)
-#         else:
-#             # Standard random crop
-#             z0 = random.randint(0, z - ps)
-#             y0 = random.randint(0, y - ps)
-#             x0 = random.randint(0, x - ps)
-#         # ---
-
-#         image_patch = image[z0:z0+ps, y0:y0+ps, x0:x0+ps]
-#         label_patch = label[z0:z0+ps, y0:y0+ps, x0:x0+ps]
-
-#         image_patch = torch.tensor(image_patch, dtype=torch.float32).unsqueeze(0)
-#         label_patch = torch.tensor(label_patch, dtype=torch.long)
-
-#         if self.augment:
-#             subject = tio.Subject(
-#                 image=tio.ScalarImage(tensor=image_patch),
-#                 label=tio.LabelMap(tensor=label_patch.unsqueeze(0))
-#             )
-#             subject = self.transform(subject)
-#             image_patch = subject.image.data
-#             label_patch = subject.label.data.squeeze(0).long()
-
-#         return image_patch, label_patch
-
 class PatchDataset(Dataset):
     def __init__(
         self,
@@ -266,8 +192,8 @@ class PatchDataset_cbam(Dataset):
 
             if len(classes) > 0:
 
-
-                if random.random() < 0.25: 
+                # Mild parotid bias 
+                if random.random() < 0.25:   
                     parotid_classes = [c for c in classes if c in [4, 5]]
 
                     if len(parotid_classes) > 0:
@@ -632,7 +558,7 @@ def sliding_window_inference(model, image, patch_size=80, stride=24, device="cud
     _, _, D, H, W = image_t.shape
     num_classes = 7
 
-    # ✅ Accumulation on CPU — avoids OOM on large volumes
+    #  Accumulation on CPU — avoids OOM on large volumes
     output     = torch.zeros((1, num_classes, D, H, W), dtype=torch.float32)  # CPU
     weight_map = torch.zeros_like(output)                                       # CPU
 
