@@ -138,37 +138,17 @@ def dice_loss(pred, target, num_classes=7 ,smooth=1e-5):
     return 1 - dice.mean()
 
 
-def compute_distance_map_batch(self, G):
-        """
-        Computes the Euclidean Distance Transform (EDT) for the boundary of each class.
-        G: One-hot encoded ground truth tensor of shape (B, C, D, H, W)
-        """
-        B, C, D, H, W = G.shape
-        
-        # --- Eq 2: Extracting the Boundary (B_c = G_c - erode(G_c)) ---
-        # We can perform morphological erosion highly efficiently on the GPU 
-        # using a 3x3x3 max pooling operation on the inverted mask.
-        G_inv = 1.0 - G
-        G_inv_dilated = F.max_pool3d(G_inv, kernel_size=3, stride=1, padding=1)
-        G_eroded = 1.0 - G_inv_dilated
-        
-        # B_c contains 1s only on the outer shell of the organ
-        B_c = (G - G_eroded).clamp(min=0)
-        
-        # --- Eq 3: Distance Transform ---
-        # Moving to CPU purely for the exact Euclidean Distance Transform
-        B_c_np = B_c.detach().cpu().numpy()
-        D_c_map_np = np.zeros_like(B_c_np, dtype=np.float32)
-        
-        for b in range(B):
-            for c in range(C):
-                # distance_transform_edt calculates distance to the nearest '0'.
-                # Our boundary is '1', so we invert the mask to calculate distance TO the boundary.
-                bg_mask = 1.0 - B_c_np[b, c]
-                D_c_map_np[b, c] = distance_transform_edt(bg_mask)
-                
-        # Send the computed distances back to the GPU
-        return torch.tensor(D_c_map_np, device=G.device, dtype=torch.float32)
+
+def compute_distance_map(mask):
+    posmask = mask.astype(bool)
+
+    if posmask.any():
+        negmask = ~posmask
+        dist_out = distance_transform_edt(negmask)
+        dist_in  = distance_transform_edt(posmask)
+        return dist_out - dist_in
+    else:
+        return np.zeros_like(mask)
 
 
 class final_PatchDataset_cbam(Dataset):
