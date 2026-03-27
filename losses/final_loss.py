@@ -14,7 +14,6 @@ class InverseDistanceBoundaryDiceLoss(nn.Module):
         self.lambda_weight = lambda_weight
         self.class_weights = class_weights
 
-    
 
     def forward(self, logits, targets,D_c_map):
         """
@@ -28,8 +27,10 @@ class InverseDistanceBoundaryDiceLoss(nn.Module):
         targets_onehot = F.one_hot(targets, num_classes=C).permute(0, 4, 1, 2, 3).float()
 
         # Creating the Weight Map 
-        W_map = 1.0 / (torch.abs(D_c_map) + self.epsilon)
-        W_map = torch.clamp(W_map, max=10.0)   # or 5.0
+        safe_dist = torch.abs(D_c_map).clamp(min=1e-3)
+
+        W_map = 1.0 / safe_dist
+        W_map = torch.clamp(W_map, max=5.0)
         W_map = W_map / (W_map.mean() + 1e-8)
         
 
@@ -39,11 +40,12 @@ class InverseDistanceBoundaryDiceLoss(nn.Module):
             weight=self.class_weights,
             reduction='none'
         ) 
+        ce_loss = torch.nan_to_num(ce_loss, nan=0.0, posinf=1.0)
         
         # Multiply by our spatial inverse distance weights and take the mean
         boundary_ce_loss = (ce_loss * W_map).mean()
         
-        # --- Eq 6: Standard Dice Loss ---
+        # Standard Dice Loss
         dims = (0, 2, 3, 4)
         intersection = torch.sum(probs * targets_onehot, dims)
         union = torch.sum(probs + targets_onehot, dims)
@@ -51,9 +53,15 @@ class InverseDistanceBoundaryDiceLoss(nn.Module):
         dice = (2.0 * intersection + 1e-5) / (union + 1e-5)
         # Ignore the background class (index 0) when computing Dice
         valid = targets_onehot.sum(dim=(0,2,3,4)) > 0
-        dice_loss = 1.0 - dice[1:][valid[1:]].mean()
+        if valid[1:].sum() > 0:
+            dice_loss = 1.0 - dice[1:][valid[1:]].mean()
+        else:
+            dice_loss = torch.tensor(0.0, device=logits.device)
         
-        # --- Eq 7: The Total Loss Function ---
+        # The Total Loss Function
         total_loss = (self.lambda_weight * dice_loss) + ((1.0 - self.lambda_weight) * boundary_ce_loss)
+        if torch.isnan(total_loss):
+            print("NaN detected in loss!")
+            total_loss = torch.tensor(0.0, device=logits.device)
         
         return total_loss
