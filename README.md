@@ -134,7 +134,18 @@ Stride: 60
 
 # Progress
 
-Full-volume evaluation
+### Full-volume evaluation
+
+
+| #     | Model                             | Architecture                   | Base Filters | Patch Size | Patches / Case | FG Sampling | Augmentation           | Batch Size | Loss                   | Optimizer             | Inference                                                 |
+| ----- | --------------------------------- | ------------------------------ | ------------ | ---------- | -------------- | ----------- | ---------------------- | ---------- | ---------------------- | --------------------- | --------------------------------------------------------- |
+| **1** | **UNet 3D (Baseline)**            | Standard 3D U-Net              | 16           | 80³        | 6              | 0.5         |  Disabled             | 2          | Cross-Entropy          | Adam                  | Sliding window (no Gaussian)                              |
+| **2** | **Attention UNet 3D**             | 3D Attention U-Net             | 16           | 80³        | 6              | 0.5         |  Disabled             | 2          | Cross-Entropy          | Adam                  | Sliding window (no Gaussian)                              |
+| **3** | **UNet++ 3D**                     | Lightweight Nested U-Net       | 16           | 80³        | 6              | 0.5         |  Disabled             | 2          | Cross-Entropy          | Adam                  | Sliding window (no Gaussian)                              |
+| **4** | **nnUNet-style (Initial)**        | Residual 3D U-Net              | 24           | 80³        | 6              | 0.5         |  Disabled             | 2          | Cross-Entropy          | Adam                  | Sliding window (simple averaging)                         |
+| **5** | **Final nnUNet Pipeline** | Residual nnUNet-style 3D U-Net | 24           | **96³**    | **12**         | **0.6**     |  TorchIO Augmentation | 2          | **Dice + CE (Hybrid)** | **AdamW + Cosine LR** | **Sliding window + Gaussian weighting + Post-processing** |
+
+
 | Model          | Mandible | Brainstem | Spinal Cord | Parotid L | Parotid R | Oral Cavity |
 | -------------- | -------- | --------- | ----------- | --------- | --------- | ----------- |
 | UNet           | 0.75     | 0.68      | ~0.00       | 0.58      | 0.74      | 0.76        |
@@ -143,6 +154,44 @@ Full-volume evaluation
 
 
 
+
+
+### Final nnUNET 
+| Organ ID | Organ         | Mean Dice  | Std Dev |
+| -------- | ------------- | ---------- | ------- |
+| 1        | Bone Mandible | **0.8928** | 0.0275  |
+| 2        | Brainstem     | **0.8015** | 0.0210  |
+| 3        | Spinal Cord   | **0.7350** | 0.0272  |
+| 4        | Parotid Left  | **0.4705** | 0.0663  |
+| 5        | Parotid Right | **0.2422** | 0.1312  |
+| 6        | Oral Cavity   | **0.8251** | 0.0580  |
+
+
+### Custom Loss Model Evaluation Comparison
+
+### lambda = 0.4
+
+| Model & Configuration | Class 1 | Class 2 | Class 3 | Class 4 (Parotid L) | Class 5 (Parotid R) | Class 6 | Mean Dice |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Model 1 (Initial Weights)**<br>`[0.05, 1, 1, 1.2, 1.8, 1.8, 1]` | 0.8960 | 0.8017 | 0.7107 | 0.8102 | 0.7981 | 0.8434 | 0.8100 |
+| **Model 2 (Revised Weights)**<br>`[0.05, 1, 1.2, 1.5, 2, 2, 1]` | **0.9132** | **0.8017** | **0.7583** | 0.8170 | 0.7837 | 0.8353 | **0.8182** |
+| **Model 3 (Spinal Favored Patching)**<br>`[0.05, 1, 1.3, 1.8, 2, 2, 1]` | 0.9119 | 0.7586 | 0.7461 | **0.8180** | **0.8033** | **0.8556** | 0.8156 |
+
+**Observations**:
+* **Model 2 (Revised Weights)** achieved the highest overall **Mean Dice (0.8182)** and performed best on Classes 1, 2, and 3.
+* **Model 3 (Spinal Favored Patching)** sacrificed some performance on Class 2, but achieved the best results for the Parotid glands (Classes 4 & 5) and Class 6.
+
+
+### Model Evaluation Comparison (Lambda = 0.6)
+
+| Model & Configuration | Class 1 | Class 2 | Class 3 | Class 4 (Parotid L) | Class 5 (Parotid R) | Class 6 | Mean Dice |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Model 1**<br>`[0.05, 1, 1, 1.2, 1.8, 1.8, 1]` | 0.9047 ± 0.0235 | **0.8100 ± 0.0349** | 0.7394 ± 0.0585 | 0.7768 ± 0.0279 | 0.7894 ± 0.0770 | 0.8007 ± 0.0609 | 0.8035 |
+| **Model 2**<br>`[0.05, 1, 1.2, 1.5, 2, 2, 1]` | **0.9142 ± 0.0266** | 0.8083 ± 0.0324 | **0.7553 ± 0.0526** | **0.8094 ± 0.0298** | **0.7975 ± 0.0571** | **0.8559 ± 0.0362** | **0.8234** |
+
+**Observations (λ=0.6)**:
+* **Model 2** significantly outperforms Model 1 across almost all classes, achieving a higher overall Mean Dice (0.8234).
+* The Parotid glands (Classes 4 & 5) and Class 6 show noticeable improvements in Model 2 upon revising the class weights.
 
 
   
