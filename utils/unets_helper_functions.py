@@ -12,6 +12,147 @@ import torchio as tio
 import scipy.ndimage as ndi
 from scipy.ndimage import distance_transform_edt
 
+from scipy.ndimage import binary_dilation
+
+class psv3_final_PatchDataset_cbam(Dataset):
+    def __init__(
+        self,
+        cases,
+        images_dir,
+        labels_dir,
+        patches_per_case=6,  
+        patch_size=96,
+        augment=False,
+        foreground_prob=0.25, 
+        global_prob=0.4  
+    ):
+        self.cases = cases
+        self.images_dir = images_dir
+        self.labels_dir = labels_dir
+        self.patch_size = patch_size
+        self.patches_per_case = patches_per_case
+        self.augment = augment
+        self.foreground_prob = foreground_prob
+        self.global_prob = global_prob
+
+        if augment:
+            self.transform = tio.Compose([
+                tio.RandomFlip(axes=(0,), p=0.5),
+                tio.RandomFlip(axes=(1,), p=0.2),
+                tio.RandomFlip(axes=(2,), p=0.2),
+                tio.RandomAffine(scales=(0.85, 1.15), degrees=15, isotropic=True),
+                tio.RandomNoise(mean=0, std=0.01),
+                tio.RandomGamma(log_gamma=(-0.3, 0.3))
+            ])
+
+    def __len__(self):
+        return len(self.cases) * self.patches_per_case
+
+    def __getitem__(self, idx):
+
+        case = self.cases[idx // self.patches_per_case]
+
+        image = nib.load(os.path.join(self.images_dir, f"{case}.nii.gz")).get_fdata(dtype=np.float32)
+        label = nib.load(os.path.join(self.labels_dir, f"{case}.nii.gz")).get_fdata().astype(np.uint8)
+
+        z, y, x = image.shape
+        ps = self.patch_size
+
+        r = random.random()
+
+        # -------- GLOBAL PATCH --------
+        if r < self.global_prob:
+            z0 = random.randint(0, z - ps)
+            y0 = (y - ps) // 2
+            x0 = (x - ps) // 2
+
+        # -------- BOUNDARY PATCH (NEW ) --------
+        elif r < self.global_prob + 0.2:
+
+            binary = (label > 0).astype(np.uint8)
+            boundary = binary_dilation(binary) ^ binary
+            boundary_voxels = np.argwhere(boundary > 0)
+
+            if len(boundary_voxels) > 0:
+                center = boundary_voxels[random.randint(0, len(boundary_voxels)-1)]
+
+                shift = np.random.randint(-ps//2, ps//2, size=3)
+                center = center + shift
+
+                z0 = int(np.clip(center[0] - ps//2, 0, z - ps))
+                y0 = int(np.clip(center[1] - ps//2, 0, y - ps))
+                x0 = int(np.clip(center[2] - ps//2, 0, x - ps))
+            else:
+                z0 = random.randint(0, z - ps)
+                y0 = random.randint(0, y - ps)
+                x0 = random.randint(0, x - ps)
+
+        # -------- FOREGROUND PATCH --------
+        elif r < self.global_prob + 0.2 + self.foreground_prob:
+
+            classes = np.unique(label)
+            classes = classes[classes != 0]
+
+            if len(classes) > 0:
+                chosen_class = random.choice(classes.tolist())
+                class_voxels = np.argwhere(label == chosen_class)
+
+                if len(class_voxels) > 0:
+                    center = class_voxels[random.randint(0, len(class_voxels)-1)]
+
+                    shift = np.random.randint(-ps//2, ps//2, size=3)
+                    center = center + shift
+
+                    z0 = int(np.clip(center[0] - ps//2, 0, z - ps))
+                    y0 = int(np.clip(center[1] - ps//2, 0, y - ps))
+                    x0 = int(np.clip(center[2] - ps//2, 0, x - ps))
+                else:
+                    z0 = random.randint(0, z - ps)
+                    y0 = random.randint(0, y - ps)
+                    x0 = random.randint(0, x - ps)
+            else:
+                z0 = random.randint(0, z - ps)
+                y0 = random.randint(0, y - ps)
+                x0 = random.randint(0, x - ps)
+
+        # -------- RANDOM PATCH --------
+        else:
+            z0 = random.randint(0, z - ps)
+            y0 = random.randint(0, y - ps)
+            x0 = random.randint(0, x - ps)
+
+        # -------- CROP --------
+        image_patch = image[z0:z0+ps, y0:y0+ps, x0:x0+ps]
+        label_patch = label[z0:z0+ps, y0:y0+ps, x0:x0+ps]
+
+        # -------- DISTANCE MAP --------
+        dist_map = np.zeros_like(label_patch, dtype=np.float32)
+
+        classes = np.unique(label_patch)
+        classes = classes[classes != 0]
+
+        for c in classes:
+            mask = (label_patch == c)
+            dist = compute_distance_map(mask)
+            dist_map[mask] = dist[mask]
+
+        image_patch = torch.tensor(image_patch, dtype=torch.float32).unsqueeze(0)
+        label_patch = torch.tensor(label_patch, dtype=torch.long)
+        dist_map = torch.tensor(dist_map, dtype=torch.float32)
+
+        if self.augment:
+            subject = tio.Subject(
+                image=tio.ScalarImage(tensor=image_patch),
+                label=tio.LabelMap(tensor=label_patch.unsqueeze(0)),
+                dist=tio.ScalarImage(tensor=dist_map.unsqueeze(0))
+            )
+            subject = self.transform(subject)
+            image_patch = subject.image.data
+            label_patch = subject.label.data.squeeze(0).long()
+            dist_map = subject.dist.data.squeeze(0)
+
+        return image_patch, label_patch, dist_map
+
 class PatchDataset(Dataset):
     def __init__(
         self,
@@ -852,10 +993,22 @@ def evaluate_full_volume_cbam(model, cases, images_dir, labels_dir, patch_size=9
 import matplotlib.pyplot as plt
 import numpy as np
 
-def show_difference_map(ct_slice, gt_slice, pred_slice, organ_id=None):
+def zoom_center(img, zoom_factor=0.5):
+    h, w = img.shape[:2]
+    
+    new_h, new_w = int(h * zoom_factor), int(w * zoom_factor)
+    
+    start_h = (h - new_h) // 2
+    start_w = (w - new_w) // 2
+    
+    return img[start_h:start_h+new_h, start_w:start_w+new_w]
+
+
+def show_difference_map(ct_slice, gt_slice, pred_slice, organ_id=None, zoom_factor=0.5):
     """
     organ_id: if None → full multi-class comparison
               if integer → show only that organ
+    zoom_factor: 0.5 means center 50% (zoomed view)
     """
 
     if organ_id is not None:
@@ -880,17 +1033,21 @@ def show_difference_map(ct_slice, gt_slice, pred_slice, organ_id=None):
     # Blue = false negative
     diff_map[false_negative] = [0, 0, 1]
 
+    # 🔥 Apply zoom consistently
+    ct_zoom = zoom_center(ct_slice, zoom_factor)
+    diff_zoom = zoom_center(diff_map, zoom_factor)
+
     plt.figure(figsize=(12,5))
 
     plt.subplot(1,2,1)
-    plt.imshow(ct_slice, cmap='gray')
-    plt.title("CT Slice")
+    plt.imshow(ct_zoom, cmap='gray')
+    plt.title(f"CT Slice (Zoom {int(zoom_factor*100)}%)")
     plt.axis("off")
 
     plt.subplot(1,2,2)
-    plt.imshow(ct_slice, cmap='gray')
-    plt.imshow(diff_map, alpha=0.6)
-    plt.title("Difference Map\nGreen=Correct, Red=FP, Blue=FN")
+    plt.imshow(ct_zoom, cmap='gray')
+    plt.imshow(diff_zoom, alpha=0.6)
+    plt.title("Difference Map (Zoomed)\nGreen=Correct, Red=FP, Blue=FN")
     plt.axis("off")
 
     plt.tight_layout()
